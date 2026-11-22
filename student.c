@@ -1,6 +1,12 @@
 #include "utils_1d.h"
 #include <limits.h>
 
+static inline double temperature(const double *current, ptrdiff_t j,
+                                 double coefficient) {
+  return current[j] +
+         coefficient * (current[j - 1] - 2.0 * current[j] + current[j + 1]);
+}
+
 int heat_eqn_solver_1d(double *heat_array, double *err, size_t num_pts) {
   int rank, ranks;
   if (MPI_Comm_rank(MPI_COMM_WORLD, &rank) != MPI_SUCCESS ||
@@ -16,8 +22,13 @@ int heat_eqn_solver_1d(double *heat_array, double *err, size_t num_pts) {
   const int left = rank > 0 ? rank - 1 : MPI_PROC_NULL;
   const int right = offset + count < (int)num_pts ? rank + 1 : MPI_PROC_NULL;
 
+  // Each step consumes one halo point. Keep the exchange within one neighbor
+  const int batch = base == 0 ? 1 : (base < 32 ? base : 32);
+  const int left_halo = left == MPI_PROC_NULL ? 1 : batch;
+  const int right_halo = right == MPI_PROC_NULL ? 1 : batch;
   double *block = heat_array + offset;
-  double *scratch = malloc(((size_t)count + 2) * sizeof(*scratch));
+  double *scratch = malloc(((size_t)left_halo + count + right_halo) *
+                           sizeof(*scratch));
   int *counts = NULL, *offsets = NULL;
 
   if (rank == 0) {
@@ -40,34 +51,52 @@ int heat_eqn_solver_1d(double *heat_array, double *err, size_t num_pts) {
   const double coefficient = dt / (dx * dx);
   double local_error = 0.0;
   double *current = block;
-  double *next = scratch;
-
   if (count > 0) {
-    // MPI_PROC_NULL leaves the physical endpoints fixed in both buffers
-    scratch[0] = block[0];
-    scratch[(size_t)count + 1] = block[(size_t)count + 1];
+    // Index 1 is the first owned point in both buffers.
+    double *next = scratch + left_halo - 1;
+    next[0] = block[0];
+    next[(size_t)count + 1] = block[(size_t)count + 1];
 
-    for (size_t step = 0; step < ITER; ++step) {
-      if (MPI_Sendrecv(current + 1, 1, MPI_DOUBLE, left, 0, current + count + 1,
-                       1, MPI_DOUBLE, right, 0, MPI_COMM_WORLD,
-                       MPI_STATUS_IGNORE) != MPI_SUCCESS ||
-          MPI_Sendrecv(current + count, 1, MPI_DOUBLE, right, 1, current, 1,
-                       MPI_DOUBLE, left, 1, MPI_COMM_WORLD,
-                       MPI_STATUS_IGNORE) != MPI_SUCCESS) {
-        goto done;
+    for (int step = 0; step < ITER; step += batch) {
+      const int steps = ITER - step < batch ? ITER - step : batch;
+      // The input already supplies both halos for the first batch
+      if (step > 0 && (left != MPI_PROC_NULL || right != MPI_PROC_NULL)) {
+        // Use zero counts and valid buffer addresses at the physical ends
+        const int to_left = left == MPI_PROC_NULL ? 0 : steps;
+        const int to_right = right == MPI_PROC_NULL ? 0 : steps;
+        if (MPI_Sendrecv(current + 1, to_left, MPI_DOUBLE, left, 0,
+                         current + count + 1, to_right, MPI_DOUBLE, right, 0,
+                         MPI_COMM_WORLD, MPI_STATUS_IGNORE) != MPI_SUCCESS ||
+            MPI_Sendrecv(current + count + 1 - to_right, to_right, MPI_DOUBLE,
+                         right, 1, current + 1 - to_left, to_left, MPI_DOUBLE,
+                         left, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE) != MPI_SUCCESS) {
+          goto done;
+        }
       }
 
-      for (size_t j = 1; j <= (size_t)count; ++j) {
-        next[j] =
-            current[j] +
-            coefficient * (current[j - 1] - 2.0 * current[j] + current[j + 1]);
-
-        local_error += dx * fabs(next[j] - current[j]);
+      for (int remaining = steps - 1; remaining >= 0; --remaining) {
+        // Shrink the halo each step. Only owned points contribute to the error
+        if (left != MPI_PROC_NULL) {
+          for (int j = 1 - remaining; j <= 0; ++j) {
+            next[j] = temperature(current, j, coefficient);
+          }
+        }
+        double step_error = 0.0;
+#pragma omp simd reduction(+:step_error)
+        for (size_t j = 1; j <= (size_t)count; ++j) {
+          next[j] = temperature(current, j, coefficient);
+          step_error += dx * fabs(next[j] - current[j]);
+        }
+        local_error += step_error;
+        if (right != MPI_PROC_NULL) {
+          for (ptrdiff_t j = (ptrdiff_t)count + 1; j <= (ptrdiff_t)count + remaining; ++j) {
+            next[j] = temperature(current, j, coefficient);
+          }
+        }
+        double *swap = current;
+        current = next;
+        next = swap;
       }
-
-      double *swap = current;
-      current = next;
-      next = swap;
     }
   }
 
