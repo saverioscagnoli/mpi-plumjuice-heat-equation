@@ -1,49 +1,106 @@
 #include "utils_1d.h"
+#include <limits.h>
 
-/* Implement the MPI solver here. You may add includes and helper functions.
- * Keep the explicit finite difference scheme and the public signature.
- * MPI is initialized/finalized by the driver. The full result and cumulative
- * error must be available on rank 0 when this function returns.
- */
+int heat_eqn_solver_1d(double *heat_array, double *err, size_t num_pts) {
+  int rank, ranks;
+  if (MPI_Comm_rank(MPI_COMM_WORLD, &rank) != MPI_SUCCESS ||
+      MPI_Comm_size(MPI_COMM_WORLD, &ranks) != MPI_SUCCESS ||
+      num_pts > INT_MAX) {
+    return -1;
+  }
 
- /**
- * @brief Solve the heat equation using an explicit finite difference scheme.
- *
- * This functions solves the heat equation iterating over ITER time steps.
- *
- * @param heat_array Array of `double` values representing the temperatures of the points.
- * @param err Pointer to a `double` value representing the error in the simulation.
- * @param num_pts Number of points in the simulation.
- *
- * @return 0 on success, -1 on error.
- */
-int heat_eqn_solver_1d(double *heat_array, double *err, size_t num_pts){
-  // Setup the parameters
-  double dx = 1.0/(num_pts+1);
-  double dt = 0.5*dx*dx;
-  size_t beg = 1;
-  size_t end = beg + num_pts - 1;
+  const int base = (int)num_pts / ranks;
+  const int extra = (int)num_pts % ranks;
+  const int count = base + (rank < extra);
+  const int offset = rank * base + (rank < extra ? rank : extra);
+  const int left = rank > 0 ? rank - 1 : MPI_PROC_NULL;
+  const int right = offset + count < (int)num_pts ? rank + 1 : MPI_PROC_NULL;
 
-  // Utilize an auxiliary array to store the new temperatures
-  double *aux = (double *) malloc((num_pts + 2) * sizeof(double));
+  double *block = heat_array + offset;
+  double *scratch = malloc(((size_t)count + 2) * sizeof(*scratch));
+  int *counts = NULL, *offsets = NULL;
 
-  for (size_t i = 0; i < ITER; i++){
+  if (rank == 0) {
+    counts = malloc((size_t)ranks * sizeof(*counts));
+    offsets = malloc((size_t)ranks * sizeof(*offsets));
+  }
 
-    // Set boundary conditions to 0
-    aux[beg - 1] = 0.0;
-    aux[end + 1] = 0.0;
+  int result = -1;
+  int ready = scratch != NULL && (rank != 0 || (counts && offsets));
+  int all_ready;
 
-    // Compute temperatures at new time step
-    for (size_t j = beg; j <= end; j++){
-      aux[j] = heat_array[j] + dt/(dx*dx)*(heat_array[j-1] - 2.0*heat_array[j] + heat_array[j+1]);
-      *err += dx*fabs(aux[j] - heat_array[j]);
-    }
+  if (MPI_Allreduce(&ready, &all_ready, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD) !=
+          MPI_SUCCESS ||
+      !all_ready) {
+    goto done;
+  }
 
-    // Copy back into the original array
-    for (size_t j = beg; j <= end; j++){
-      heat_array[j] = aux[j];
+  const double dx = 1.0 / (num_pts + 1);
+  const double dt = 0.5 * dx * dx;
+  const double coefficient = dt / (dx * dx);
+  double local_error = 0.0;
+  double *current = block;
+  double *next = scratch;
+
+  if (count > 0) {
+    // MPI_PROC_NULL leaves the physical endpoints fixed in both buffers
+    scratch[0] = block[0];
+    scratch[(size_t)count + 1] = block[(size_t)count + 1];
+
+    for (size_t step = 0; step < ITER; ++step) {
+      if (MPI_Sendrecv(current + 1, 1, MPI_DOUBLE, left, 0, current + count + 1,
+                       1, MPI_DOUBLE, right, 0, MPI_COMM_WORLD,
+                       MPI_STATUS_IGNORE) != MPI_SUCCESS ||
+          MPI_Sendrecv(current + count, 1, MPI_DOUBLE, right, 1, current, 1,
+                       MPI_DOUBLE, left, 1, MPI_COMM_WORLD,
+                       MPI_STATUS_IGNORE) != MPI_SUCCESS) {
+        goto done;
+      }
+
+      for (size_t j = 1; j <= (size_t)count; ++j) {
+        next[j] =
+            current[j] +
+            coefficient * (current[j - 1] - 2.0 * current[j] + current[j + 1]);
+
+        local_error += dx * fabs(next[j] - current[j]);
+      }
+
+      double *swap = current;
+      current = next;
+      next = swap;
     }
   }
-  free(aux);
-  return 0;
+
+  if (rank == 0) {
+    for (int r = 0; r < ranks; ++r) {
+      counts[r] = base + (r < extra);
+      offsets[r] = r * base + (r < extra ? r : extra);
+    }
+
+    if (current != block) {
+      memcpy(block + 1, current + 1, (size_t)count * sizeof(*block));
+    }
+  }
+
+  double total_error;
+
+  if (MPI_Gatherv(rank == 0 ? MPI_IN_PLACE : current + 1, count, MPI_DOUBLE,
+                  heat_array + 1, counts, offsets, MPI_DOUBLE, 0,
+                  MPI_COMM_WORLD) != MPI_SUCCESS ||
+      MPI_Reduce(&local_error, &total_error, 1, MPI_DOUBLE, MPI_SUM, 0,
+                 MPI_COMM_WORLD) != MPI_SUCCESS) {
+    goto done;
+  }
+
+  if (rank == 0) {
+    *err += total_error;
+  }
+
+  result = 0;
+
+done:
+  free(scratch);
+  free(counts);
+  free(offsets);
+  return result;
 }
